@@ -66,15 +66,24 @@ Streamlit will open the app in your browser, usually at
 5. Click **Deploy**.
 6. Once it finishes building, open the app link on your phone to try it.
 
-The repository includes a `runtime.txt` file that pins the app to Python
-3.11. This matters: Streamlit Community Cloud otherwise defaults to the
-newest available Python version, and packages like `pandas` or `pillow`
-(a dependency of Streamlit itself) may not yet publish ready-to-install
+The repository includes a `.python-version` file that pins the app to
+Python 3.11 (Streamlit Community Cloud otherwise defaults to the newest
+available Python version, and packages like `pandas` or `pillow` - a
+dependency of Streamlit itself - may not yet publish ready-to-install
 wheels for it, which makes the build fail while trying to compile them
-from source. If your deployment fails with an error mentioning `pillow`,
-`zlib`, or "Failed to download and build", make sure `runtime.txt` is
-present in the repository root, then use the app's menu (⋮) and select
-**Reboot app** to force it to rebuild with Python 3.11.
+from source).
+
+**Important:** the Python version is chosen when the app is first
+provisioned. If you already created the app and it failed with an error
+mentioning `pillow`, `zlib`, or "Failed to download and build", clicking
+**Reboot app** is not enough, since it reuses the same environment.
+Instead:
+
+1. Delete the existing app from your Streamlit Cloud dashboard (options
+   menu ⋮ next to the app → **Delete**).
+2. Create it again following the steps above. With `.python-version`
+   already in the repository, the new deployment should provision Python
+   3.11 from the start and install without errors.
 
 ### Setting the administrator password
 
