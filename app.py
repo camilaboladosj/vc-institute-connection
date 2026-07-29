@@ -438,8 +438,12 @@ def render_recommendations():
 
     if not recs:
         st.info(
-            "We could not find any eligible matches yet. Check back once more "
-            "cohort members have completed their profiles."
+            "We could not find any eligible matches for you right now. This "
+            "usually just means not enough other cohort members have added "
+            "their email, completed their interests, and consented yet. "
+            "Please check back in a few days: come back to this page, search "
+            "your name again, and confirm your consent once more to refresh "
+            "your recommendations."
         )
     else:
         for rec in recs:
