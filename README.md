@@ -66,6 +66,16 @@ Streamlit will open the app in your browser, usually at
 5. Click **Deploy**.
 6. Once it finishes building, open the app link on your phone to try it.
 
+The repository includes a `runtime.txt` file that pins the app to Python
+3.11. This matters: Streamlit Community Cloud otherwise defaults to the
+newest available Python version, and packages like `pandas` or `pillow`
+(a dependency of Streamlit itself) may not yet publish ready-to-install
+wheels for it, which makes the build fail while trying to compile them
+from source. If your deployment fails with an error mentioning `pillow`,
+`zlib`, or "Failed to download and build", make sure `runtime.txt` is
+present in the repository root, then use the app's menu (⋮) and select
+**Reboot app** to force it to rebuild with Python 3.11.
+
 ### Setting the administrator password
 
 The admin export section (see below) reads its password from Streamlit
