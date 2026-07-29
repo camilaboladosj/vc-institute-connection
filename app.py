@@ -577,6 +577,16 @@ def render_admin_sidebar():
             new_profiles = profiles_df[profiles_df["source"] == "new"]
             feedback_df = database.get_all_feedback_df()
 
+            has_email = profiles_df["email"].fillna("").str.strip() != ""
+            consented = profiles_df["consent"] == 1
+
+            st.markdown("#### Usage")
+            st.metric("People who added their email", int(has_email.sum()))
+            st.metric("People who consented to participate", int(consented.sum()))
+            st.metric("New profiles created", len(new_profiles))
+            st.metric("Feedback entries submitted", len(feedback_df))
+            st.divider()
+
             st.download_button(
                 "Download updated profiles (CSV)",
                 updated_profiles.to_csv(index=False).encode("utf-8"),
