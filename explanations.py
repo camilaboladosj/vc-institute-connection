@@ -1,106 +1,108 @@
-"""Rule-based explanations for each match. No external AI is used.
+"""
+explanations.py
+----------------
+Genera explicaciones de match usando reglas simples (sin IA externa).
 
-Every sentence is built directly from the two profiles' own data, so the
-explanation never states anything that is not actually in the records.
+Todo el texto generado aquí es el que verá el usuario final, por lo tanto
+está en ingles, tal como pide la especificacion del proyecto.
 """
 
 import re
 
+# Palabras muy comunes en ingles que se ignoran al comparar intereses (stopwords basicas)
 STOPWORDS = {
-    "and", "or", "the", "a", "an", "of", "in", "for", "to", "with", "on",
-    "y", "de", "la", "el", "en", "para", "con", "un", "una", "los", "las",
+    "the", "and", "for", "with", "that", "this", "from", "into", "about",
+    "your", "you", "are", "our", "their", "have", "has", "will", "can",
+    "not", "but", "all", "any", "who", "what", "how", "when", "where",
+    "a", "an", "of", "in", "on", "to", "is", "it", "as", "at", "be", "or",
 }
 
 
-def _split_terms(text):
+def _keywords(text, min_len=4):
+    """Extrae palabras significativas (sin stopwords) de un texto, en minusculas y sin duplicados."""
     if not text:
         return []
-    parts = re.split(r"[,;/]|\band\b|\by\b", text, flags=re.IGNORECASE)
-    terms = []
-    for part in parts:
-        term = part.strip(" .").lower()
-        if term and term not in STOPWORDS and len(term) > 2:
-            terms.append(term)
-    return terms
+    words = re.findall(r"[a-zA-Z]+", text.lower())
+    seen = []
+    for w in words:
+        if len(w) >= min_len and w not in STOPWORDS and w not in seen:
+            seen.append(w)
+    return seen
 
 
-def _shared_terms(text_a, text_b, limit=3):
-    terms_a = _split_terms(text_a)
-    terms_b = set(_split_terms(text_b))
-    shared = []
-    for term in terms_a:
-        if term in terms_b and term not in shared:
-            shared.append(term)
-        if len(shared) >= limit:
-            break
-    return shared
+def _common_keywords(text_a, text_b, limit=3):
+    """Devuelve hasta 'limit' palabras que aparecen en ambos textos."""
+    words_a = _keywords(text_a)
+    words_b = set(_keywords(text_b))
+    common = [w for w in words_a if w in words_b]
+    return common[:limit]
 
 
-def _truncate(text, max_len=90):
-    text = (text or "").strip()
-    if len(text) <= max_len:
-        return text
-    return text[:max_len].rsplit(" ", 1)[0] + "..."
-
-
-def build_explanation(user_profile, candidate_profile):
-    """Return (reason_text, conversation_topics list) for this match."""
+def generate_reason(profile_a, profile_b, scores):
+    """
+    Construye una explicacion breve y natural del match, usando solo datos reales.
+    profile_a = el usuario que esta viendo las recomendaciones.
+    profile_b = la persona recomendada.
+    """
+    name_b = profile_b.get("full_name", "This person")
     sentences = []
-    topics = []
 
-    # 1. Shared interests.
-    shared_interests = _shared_terms(
-        user_profile.get("interests", ""), candidate_profile.get("interests", "")
-    )
-    if shared_interests:
-        sentences.append(
-            "You both share an interest in " + ", ".join(shared_interests) + "."
-        )
-        topics.extend(shared_interests)
-
-    # 2. Shared primary sector.
-    sector_a = (user_profile.get("primary_sector") or "").strip()
-    sector_b = (candidate_profile.get("primary_sector") or "").strip()
+    # 1. Coincidencia de sector
+    sector_a = (profile_a.get("primary_sector") or "").strip()
+    sector_b = (profile_b.get("primary_sector") or "").strip()
     if sector_a and sector_b and sector_a.lower() == sector_b.lower():
-        sentences.append(f"You are both active in {sector_a}.")
-        if sector_a.lower() not in [t.lower() for t in topics]:
-            topics.append(sector_a)
+        sentences.append(f"You both focus on {sector_a}.")
 
-    # 3. Shared discipline.
-    discipline_a = (user_profile.get("discipline") or "").strip()
-    discipline_b = (candidate_profile.get("discipline") or "").strip()
-    if discipline_a and discipline_b and discipline_a.lower() == discipline_b.lower():
-        sentences.append(f"You share a background in {discipline_a}.")
-
-    # 4. Complementarity: what the candidate needs vs. what the user offers.
-    candidate_needs = candidate_profile.get("needs", "")
-    user_offering = user_profile.get("offering", "")
-    if candidate_needs and user_offering:
-        name = candidate_profile.get("full_name", "This person")
+    # 2. Complementariedad: lo que A busca y lo que B ofrece (y viceversa)
+    common_need_offer = _common_keywords(profile_a.get("needs"), profile_b.get("offering"))
+    if common_need_offer:
         sentences.append(
-            f"{name} is looking for {_truncate(candidate_needs)}, "
-            f"and you can offer {_truncate(user_offering)}."
+            f"{name_b} can offer something close to what you are looking for, "
+            f"particularly around {', '.join(common_need_offer)}."
         )
+    else:
+        common_offer_need = _common_keywords(profile_a.get("offering"), profile_b.get("needs"))
+        if common_offer_need:
+            sentences.append(
+                f"What you can offer aligns with what {name_b} is looking for, "
+                f"particularly around {', '.join(common_offer_need)}."
+            )
 
-    # 5. Complementarity: what the user needs vs. what the candidate offers.
-    user_needs = user_profile.get("needs", "")
-    candidate_offering = candidate_profile.get("offering", "")
-    if user_needs and candidate_offering:
-        sentences.append(
-            f"You are looking for {_truncate(user_needs)}, and they can offer "
-            f"{_truncate(candidate_offering)}."
-        )
+    # 3. Intereses en comun
+    common_interests = _common_keywords(profile_a.get("interests"), profile_b.get("interests"))
+    if common_interests:
+        sentences.append(f"You share an interest in {', '.join(common_interests)}.")
+
+    # 4. Disciplinas diferentes pero sector en comun (complementariedad por area)
+    disc_a = (profile_a.get("discipline") or "").strip()
+    disc_b = (profile_b.get("discipline") or "").strip()
+    if disc_a and disc_b and disc_a.lower() != disc_b.lower() and sector_a and sector_b and sector_a.lower() == sector_b.lower():
+        sentences.append(f"Your backgrounds are complementary: {disc_a} and {disc_b}.")
 
     if not sentences:
         sentences.append(
-            "Your profiles were matched based on overall thematic similarity."
+            f"Your profile and {name_b}'s profile show related interests worth exploring in conversation."
         )
 
-    if not topics:
-        # Fall back to sector/discipline if no shared interest terms were found.
-        for value in [sector_a, discipline_a]:
-            if value and value not in topics:
-                topics.append(value)
+    return " ".join(sentences)
 
-    reason = " ".join(sentences[:3])
-    return reason, topics[:3]
+
+def generate_topics(profile_a, profile_b, limit=3):
+    """
+    Genera hasta 'limit' temas sugeridos para iniciar la conversacion,
+    a partir de palabras clave compartidas en intereses y tesis de inversion.
+    """
+    text_a = " ".join([profile_a.get("interests") or "", profile_a.get("investment_thesis") or ""])
+    text_b = " ".join([profile_b.get("interests") or "", profile_b.get("investment_thesis") or ""])
+
+    common = _common_keywords(text_a, text_b, limit=limit)
+    topics = [w.capitalize() for w in common]
+
+    # Si no hay suficientes palabras en comun, se completa con el sector compartido
+    if len(topics) < limit:
+        sector_a = (profile_a.get("primary_sector") or "").strip()
+        sector_b = (profile_b.get("primary_sector") or "").strip()
+        if sector_a and sector_a.lower() == (sector_b or "").lower() and sector_a not in topics:
+            topics.append(sector_a)
+
+    return topics[:limit] if topics else ["General introduction"]

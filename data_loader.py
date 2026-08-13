@@ -1,163 +1,143 @@
-"""Reads the source Excel file and imports the 'All People' sheet into SQLite.
+"""
+data_loader.py
+--------------
+Importa los datos de la hoja "All People" del Excel original hacia la base SQLite.
 
-The original Excel file is never modified. Column names are matched using
-normalized aliases so small header variations do not break the import.
+Reglas importantes:
+- NUNCA se modifica el archivo Excel.
+- La importación solo ocurre una vez: si un registro ya fue importado
+  (identificado por su número de fila original), no se vuelve a insertar.
+- Si el Excel cambia después, esto NO sobrescribe perfiles ya editados en la app.
+- Los nombres de columnas se detectan de forma flexible, por si el Excel
+  tiene pequeñas variaciones en los encabezados.
 """
 
 import re
-
 import pandas as pd
 
-import database
+import database as db
 
 EXCEL_PATH = "data/VC_Lab_C7_Introductions_v4.xlsx"
 SHEET_NAME = "All People"
 
-# Canonical internal field -> list of normalized header aliases to match.
-COLUMN_ALIASES = {
-    "full_name": ["name", "full name", "full_name"],
-    "geography": ["geography", "region", "country"],
+# Para cada campo interno, lista de posibles nombres de columna (normalizados) que lo representan.
+# Se usa coincidencia flexible: se ignoran espacios, guiones, paréntesis y mayúsculas/minúsculas.
+COLUMN_CANDIDATES = {
+    "full_name": ["name", "fullname", "full name"],
+    "geography": ["geography", "region", "location"],
     "category": ["category"],
     "discipline": ["discipline"],
-    "primary_sector": ["sector primary", "primary sector", "sector (primary)"],
-    "secondary_sector": ["sector secondary", "secondary sector", "sector (secondary)"],
-    "focus_area": [
-        "sub category focus area",
-        "sub-category (focus area)",
-        "focus area",
-        "sub category",
-    ],
-    "functional_expertise": ["functional expertise"],
-    "current_context": [
-        "current role context",
-        "current role / context",
-        "current role",
-        "role context",
-    ],
-    "linkedin": ["linkedin", "linkedin profile", "linkedin url"],
+    "primary_sector": ["sectorprimary", "primarysector", "sector1"],
+    "secondary_sector": ["sectorsecondary", "secondarysector", "sector2"],
+    "sub_category": ["subcategoryfocusarea", "subcategory", "focusarea"],
+    "functional_expertise": ["functionalexpertise", "expertise"],
+    "current_context": ["currentrolecontext", "currentrole", "context", "role"],
+    "linkedin": ["linkedin", "linkedinprofile", "linkedinurl"],
 }
 
 
-def normalize_header(header):
-    header = str(header).lower().strip()
-    header = re.sub(r"[()/_-]", " ", header)
-    header = re.sub(r"[^a-z0-9\s]", "", header)
-    header = re.sub(r"\s+", " ", header).strip()
-    return header
+def _normalize(col_name):
+    """Convierte 'Sector (Primary)' -> 'sectorprimary' para comparar sin importar formato."""
+    return re.sub(r"[^a-z0-9]", "", str(col_name).lower())
 
 
-def detect_columns(columns):
-    """Map each canonical field to the actual column name found in the sheet.
-
-    First pass matches normalized aliases exactly. A second, looser pass
-    only considers columns not already claimed by another field, and only
-    matches on whole-word overlap (never a bare substring), so a short
-    alias like "category" cannot hijack an unrelated multi-word column
-    such as "Sub-Category (Focus Area)".
+def detect_columns(df_columns):
     """
-    normalized_lookup = {normalize_header(col): col for col in columns}
+    Recorre las columnas reales del Excel y arma un mapeo:
+    campo_interno -> nombre_real_de_columna
+    Si no encuentra una columna para un campo, ese campo queda en None (se maneja con normalidad).
+    """
+    normalized_map = {_normalize(c): c for c in df_columns}
     mapping = {}
-    used_columns = set()
-
-    for field, aliases in COLUMN_ALIASES.items():
-        for alias in aliases:
-            if alias in normalized_lookup:
-                original_col = normalized_lookup[alias]
-                mapping[field] = original_col
-                used_columns.add(original_col)
+    for internal_field, candidates in COLUMN_CANDIDATES.items():
+        found = None
+        for candidate in candidates:
+            if candidate in normalized_map:
+                found = normalized_map[candidate]
                 break
-
-    for field, aliases in COLUMN_ALIASES.items():
-        if field in mapping:
-            continue
-        for norm_col, original_col in normalized_lookup.items():
-            if original_col in used_columns:
-                continue
-            col_words = set(norm_col.split())
-            matched = False
-            for alias in aliases:
-                alias_words = set(alias.split())
-                if len(alias_words) < 2:
-                    continue
-                if alias_words <= col_words or col_words <= alias_words:
-                    matched = True
-                    break
-            if matched:
-                mapping[field] = original_col
-                used_columns.add(original_col)
-                break
+        mapping[internal_field] = found
     return mapping
 
 
-def load_all_people(path=EXCEL_PATH, sheet_name=SHEET_NAME):
-    """Read the source sheet and return a DataFrame with standardized columns
-    plus the original row index (0-based, matching the Excel data rows)."""
-    df = pd.read_excel(path, sheet_name=sheet_name)
-    column_map = detect_columns(df.columns)
-
-    standardized = pd.DataFrame()
-    for field in COLUMN_ALIASES:
-        source_col = column_map.get(field)
-        if source_col is not None:
-            standardized[field] = df[source_col].astype(str).replace("nan", "").str.strip()
-        else:
-            standardized[field] = ""
-
-    standardized["original_excel_row"] = df.index
-
-    # Fold the focus area into current_context so no information is lost,
-    # since it is not part of the core profile schema.
-    def merge_focus(row):
-        context = row["current_context"]
-        focus = row["focus_area"]
-        if focus and focus.lower() not in context.lower():
-            return f"{context} (Focus: {focus})" if context else f"Focus: {focus}"
-        return context
-
-    standardized["current_context"] = standardized.apply(merge_focus, axis=1)
-    standardized = standardized.drop(columns=["focus_area"])
-
-    # Drop rows without a usable name.
-    standardized = standardized[standardized["full_name"].str.strip() != ""]
-    return standardized
+def _clean_value(value):
+    """Limpia valores tipo NaN, None o espacios en blanco provenientes del Excel."""
+    if value is None:
+        return ""
+    if isinstance(value, float) and pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if text.lower() == "nan":
+        return ""
+    return text
 
 
-def import_new_records():
-    """Import any 'All People' rows not yet present in the profiles table.
+def load_excel_dataframe():
+    """Lee la hoja 'All People' del Excel y devuelve el DataFrame junto con el mapeo de columnas."""
+    df = pd.read_excel(EXCEL_PATH, sheet_name=SHEET_NAME)
+    mapping = detect_columns(df.columns)
+    return df, mapping
 
-    Existing profiles (created or edited from the app) are never touched.
+
+def import_initial_data():
     """
-    database.init_db()
-    already_imported = database.get_all_excel_row_ids()
-    df = load_all_people()
+    Importa los registros del Excel hacia SQLite, solo si no fueron importados antes.
+    Se identifica cada fila original por su índice (original_excel_row).
+    Devuelve la cantidad de perfiles nuevos importados.
+    """
+    df, mapping = load_excel_dataframe()
 
-    new_records = []
-    for _, row in df.iterrows():
-        excel_row = int(row["original_excel_row"])
-        if excel_row in already_imported:
-            continue
-        new_records.append(
-            {
-                "original_excel_row": excel_row,
-                "full_name": row["full_name"],
-                "email": None,
-                "geography": row["geography"],
-                "organization": "",
-                "current_role": "",
-                "category": row["category"],
-                "discipline": row["discipline"],
-                "primary_sector": row["primary_sector"],
-                "secondary_sector": row["secondary_sector"],
-                "functional_expertise": row["functional_expertise"],
-                "current_context": row["current_context"],
-                "linkedin": row["linkedin"],
-                "interests": "",
-                "investment_thesis": "",
-                "offering": "",
-                "needs": "",
-                "desired_connections": "",
-            }
-        )
+    conn = db.get_connection()
+    already_imported_rows = set(
+        r["original_excel_row"]
+        for r in conn.execute(
+            "SELECT original_excel_row FROM profiles WHERE source = 'excel' AND original_excel_row IS NOT NULL"
+        ).fetchall()
+    )
+    conn.close()
 
-    database.bulk_insert_excel_profiles(new_records)
-    return len(new_records)
+    imported_count = 0
+    for idx, row in df.iterrows():
+        if idx in already_imported_rows:
+            continue  # ya fue importado antes, no se vuelve a insertar
+
+        full_name = _clean_value(row.get(mapping.get("full_name"))) if mapping.get("full_name") else ""
+        if not full_name:
+            continue  # fila sin nombre, se ignora
+
+        data = {
+            "source": "excel",
+            "original_excel_row": int(idx),
+            "full_name": full_name,
+            "email": "",
+            "geography": _clean_value(row.get(mapping.get("geography"))) if mapping.get("geography") else "",
+            "organization": "",  # el Excel original no separa organización, se completa luego en la app
+            "current_role": "",  # idem, se completa luego en la app si el usuario lo desea
+            "category": _clean_value(row.get(mapping.get("category"))) if mapping.get("category") else "",
+            "discipline": _clean_value(row.get(mapping.get("discipline"))) if mapping.get("discipline") else "",
+            "primary_sector": _clean_value(row.get(mapping.get("primary_sector"))) if mapping.get("primary_sector") else "",
+            "secondary_sector": _clean_value(row.get(mapping.get("secondary_sector"))) if mapping.get("secondary_sector") else "",
+            "sub_category": _clean_value(row.get(mapping.get("sub_category"))) if mapping.get("sub_category") else "",
+            "functional_expertise": _clean_value(row.get(mapping.get("functional_expertise"))) if mapping.get("functional_expertise") else "",
+            "current_context": _clean_value(row.get(mapping.get("current_context"))) if mapping.get("current_context") else "",
+            "linkedin": _clean_value(row.get(mapping.get("linkedin"))) if mapping.get("linkedin") else "",
+            "interests": "",
+            "investment_thesis": "",
+            "offering": "",
+            "needs": "",
+            "desired_connections": "",
+            "consent": 0,
+            "consent_date": None,
+        }
+        db.create_profile(data)
+        imported_count += 1
+
+    return imported_count
+
+
+def ensure_data_loaded():
+    """
+    Se llama al inicio de la app.
+    Crea la base si no existe y ejecuta la importación inicial (idempotente).
+    """
+    db.init_db()
+    return import_initial_data()
