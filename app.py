@@ -1,649 +1,570 @@
-"""VC INSTITUTE CONNECTION - Streamlit prototype.
+"""
+app.py
+------
+Aplicación principal de VC INSTITUTE CONNECTION.
 
-A simple internal tool that lets VC Institute cohort members find their
-profile (or create one), state their interests and what they can offer or
-are looking for, consent to share their data, and receive rule-based,
-TF-IDF driven connection recommendations with contact details.
+Flujo (guardado en st.session_state["stage"]):
+  search        -> buscar perfil por nombre o crear uno nuevo
+  profile_form  -> revisar/editar perfil existente o crear uno nuevo + completar campos de matching
+  consent       -> aceptar (o no) compartir los datos
+  connections   -> ver hasta 5 conexiones recomendadas
+  feedback      -> evaluar si las conexiones fueron utiles
+
+Todo el texto visible para el usuario esta en ingles, tal como pide la especificacion.
+Los comentarios del codigo estan en español para que sea mas facil de entender y mantener.
 """
 
 import urllib.parse
-from datetime import datetime
 
-import pandas as pd
 import streamlit as st
 
+import database as db
 import data_loader
-import database
 import matching
-from explanations import build_explanation
 
-st.set_page_config(page_title="VC INSTITUTE CONNECTION", page_icon=None, layout="centered")
+# ---------------------------------------------------------------------------
+# Configuracion general de la pagina
+# ---------------------------------------------------------------------------
 
-STEPS = ["Profile", "Interests", "Consent", "Connections", "Evaluation"]
-STAGE_TO_STEP = {
-    "landing": 1,
-    "review_profile": 1,
-    "create_profile": 1,
-    "matching_form": 2,
-    "consent": 3,
-    "recommendations": 4,
-    "feedback": 5,
-}
-
-RESULT_TYPE_OPTIONS = [
-    "We shared knowledge",
-    "We identified common interests",
-    "A potential collaboration emerged",
-    "A potential investment emerged",
-    "An introduction or contact emerged",
-    "We agreed to talk again",
-    "There wasn't enough alignment",
-    "Other",
-]
-
-CONSENT_TEXT = (
-    "I agree to participate in VC Institute Connection and authorize my name, "
-    "email address, and LinkedIn profile to be shared with participants who "
-    "receive my profile as a recommended connection."
+st.set_page_config(
+    page_title="VC INSTITUTE CONNECTION",
+    page_icon=None,
+    layout="centered",  # una sola columna, mas facil de usar desde el telefono
 )
 
-EMAIL_REGEX = r"^[^@\s]+@[^@\s]+\.[^@\s]+$"
+# Colores neutros, azul oscuro como color principal. Diseño sobrio, sin animaciones.
+st.markdown(
+    """
+    <style>
+        .stButton > button {
+            width: 100%;
+            border-radius: 6px;
+            padding: 0.6rem 1rem;
+            font-weight: 600;
+        }
+        div[data-testid="stForm"] button {
+            background-color: #10265e;
+            color: white;
+        }
+        .match-card {
+            border: 1px solid #d7dce3;
+            border-radius: 10px;
+            padding: 1.1rem 1.2rem;
+            margin-bottom: 1.2rem;
+            background-color: #f7f9fc;
+        }
+        .match-score {
+            color: #10265e;
+            font-weight: 700;
+            font-size: 1.05rem;
+        }
+        h1 {
+            color: #10265e;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
+
+# ---------------------------------------------------------------------------
+# Inicializacion (se ejecuta una sola vez por sesion de servidor gracias a cache)
+# ---------------------------------------------------------------------------
 
 @st.cache_resource
-def bootstrap():
-    """Create the database and import Excel records once per app instance."""
-    database.init_db()
-    imported = data_loader.import_new_records()
-    return imported
+def _initialize_database_once():
+    """Crea la base SQLite (si no existe) e importa los datos del Excel (si no fueron importados)."""
+    return data_loader.ensure_data_loaded()
 
 
-def init_session_state():
-    defaults = {
-        "stage": "landing",
-        "search_query": "",
-        "profile_id": None,
-        "is_new_profile": False,
-        "recommendations": None,
-        "confirm_new_person": False,
-        "feedback_target_id": None,
-        "feedback_saved": False,
-    }
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
+_initialize_database_once()
+
+# Valores por defecto de session_state
+DEFAULTS = {
+    "stage": "search",
+    "profile_id": None,
+    "is_new_profile": False,
+    "search_query": "",
+    "duplicate_warning_shown": False,
+}
+for key, value in DEFAULTS.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
 
 
-def go_to(stage):
-    st.session_state.stage = stage
+# ---------------------------------------------------------------------------
+# Barra de progreso simple
+# ---------------------------------------------------------------------------
 
-
-def render_header():
-    st.markdown(
-        "<h1 style='color:#0B2545; margin-bottom:0;'>VC INSTITUTE CONNECTION</h1>",
-        unsafe_allow_html=True,
-    )
-    st.caption("Find people in the cohort worth connecting with.")
+STAGE_ORDER = ["search", "profile_form", "consent", "connections", "feedback"]
+STAGE_LABELS = {
+    "search": "1. Profile",
+    "profile_form": "2. Interests",
+    "consent": "3. Consent",
+    "connections": "4. Connections",
+    "feedback": "5. Feedback",
+}
 
 
 def render_progress():
-    step = STAGE_TO_STEP.get(st.session_state.stage, 1)
-    st.progress(step / len(STEPS))
-    st.caption(f"Step {step} of {len(STEPS)}: {STEPS[step - 1]}")
+    current_index = STAGE_ORDER.index(st.session_state["stage"])
+    cols = st.columns(len(STAGE_ORDER))
+    for i, key in enumerate(STAGE_ORDER):
+        with cols[i]:
+            if i < current_index:
+                st.markdown("<div style='text-align:center; color:#10265e;'>✓</div>", unsafe_allow_html=True)
+            elif i == current_index:
+                st.markdown("<div style='text-align:center; color:#10265e; font-weight:700;'>●</div>", unsafe_allow_html=True)
+            else:
+                st.markdown("<div style='text-align:center; color:#c3c9d3;'>○</div>", unsafe_allow_html=True)
+            st.caption(STAGE_LABELS[key].split(". ")[1])
+    st.progress(current_index / (len(STAGE_ORDER) - 1))
 
 
-def valid_email(email):
-    import re
+def go_to(stage):
+    st.session_state["stage"] = stage
+    st.rerun()
 
-    return bool(re.match(EMAIL_REGEX, (email or "").strip()))
 
+# ---------------------------------------------------------------------------
+# STAGE: search
+# ---------------------------------------------------------------------------
 
-# --------------------------------------------------------------------------
-# Stage: landing (search or create)
-# --------------------------------------------------------------------------
+def render_search_stage():
+    st.title("VC INSTITUTE CONNECTION")
+    st.write("Find people in the cohort worth connecting with.")
 
-def render_landing():
     st.subheader("Find your profile")
-    query = st.text_input("Search your profile by name", value=st.session_state.search_query)
-    st.session_state.search_query = query
-    st.button("Find my profile", use_container_width=True)
+    query = st.text_input("Search your profile by name", value=st.session_state["search_query"])
+    st.session_state["search_query"] = query
 
     if query.strip():
-        matches = database.search_profiles_by_name(query)
+        matches = db.search_profiles_by_name(query)
         if matches:
-            st.write("Select your name from the list below:")
-            for match in matches:
-                label_parts = [match["full_name"]]
-                extra = match.get("organization") or match.get("current_context") or match.get("geography")
-                if extra:
-                    label_parts.append(f"({extra[:40]})")
-                label = " ".join(label_parts)
-                if st.button(label, key=f"select_{match['id']}", use_container_width=True):
-                    st.session_state.profile_id = match["id"]
-                    st.session_state.is_new_profile = False
-                    go_to("review_profile")
-                    st.rerun()
+            st.write("Select your name:")
+            for m in matches:
+                if st.button(m["full_name"], key=f"match_{m['id']}"):
+                    st.session_state["profile_id"] = m["id"]
+                    st.session_state["is_new_profile"] = False
+                    go_to("profile_form")
         else:
             st.info("No matches found. You can create a new profile below.")
 
     st.divider()
     st.write("Not in the database?")
-    if st.button("Create a profile", use_container_width=True):
-        st.session_state.profile_id = None
-        st.session_state.is_new_profile = True
-        go_to("create_profile")
-        st.rerun()
+    if st.button("Create a profile"):
+        st.session_state["profile_id"] = None
+        st.session_state["is_new_profile"] = True
+        st.session_state["duplicate_warning_shown"] = False
+        go_to("profile_form")
 
 
-# --------------------------------------------------------------------------
-# Stage: review_profile (existing Excel-sourced profile)
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# STAGE: profile_form (revisar/editar existente, o crear nuevo) + campos de matching
+# ---------------------------------------------------------------------------
 
-def render_review_profile():
-    profile = database.get_profile(st.session_state.profile_id)
-    if not profile:
-        st.error("We could not find that profile. Please search again.")
-        if st.button("Back to search"):
-            go_to("landing")
-            st.rerun()
-        return
+def render_profile_form_stage():
+    is_new = st.session_state["is_new_profile"]
+    existing = None
+    if not is_new and st.session_state["profile_id"]:
+        existing = db.get_profile_by_id(st.session_state["profile_id"])
 
-    st.subheader("Review your information")
-    st.success(
-        "We found your profile. Review the information, add your email, "
-        "and complete your interests."
-    )
+    if existing:
+        st.subheader("Review your information")
+        st.write("We found your profile. Review the information, add your email, and complete your interests.")
+    else:
+        st.subheader("Create a profile")
+        st.write("Fill in your basic information to join VC Institute Connection.")
 
-    with st.form("review_profile_form"):
-        full_name = st.text_input("Name", value=profile.get("full_name") or "")
-        email = st.text_input(
-            "Email address (required)", value=profile.get("email") or ""
+    existing = existing or {}
+
+    if st.button("← Back to search"):
+        st.session_state["duplicate_warning_shown"] = False
+        go_to("search")
+
+    with st.form("profile_form", clear_on_submit=False):
+        full_name = st.text_input("Full name", value=existing.get("full_name", ""))
+        email = st.text_input("Email address", value=existing.get("email", ""))
+
+        st.markdown("**Basic information**")
+        geography = st.text_input("Geography / country / region", value=existing.get("geography", ""))
+        organization = st.text_input("Organization or company", value=existing.get("organization", ""))
+        current_role_field = st.text_input(
+            "Current role / professional context",
+            value=existing.get("current_role") or existing.get("current_context") or "",
         )
-        geography = st.text_input("Geography", value=profile.get("geography") or "")
-        category = st.text_input("Category", value=profile.get("category") or "")
-        organization = st.text_input(
-            "Organization or company (optional)", value=profile.get("organization") or ""
-        )
-        discipline = st.text_input("Discipline", value=profile.get("discipline") or "")
-        primary_sector = st.text_input(
-            "Sector (Primary)", value=profile.get("primary_sector") or ""
-        )
-        secondary_sector = st.text_input(
-            "Sector (Secondary)", value=profile.get("secondary_sector") or ""
-        )
-        functional_expertise = st.text_input(
-            "Functional Expertise", value=profile.get("functional_expertise") or ""
-        )
-        current_context = st.text_area(
-            "Current Role / Context", value=profile.get("current_context") or "", height=90
-        )
-        linkedin = st.text_input("LinkedIn (optional)", value=profile.get("linkedin") or "")
+        category = st.text_input("Category", value=existing.get("category", ""))
+        discipline = st.text_input("Discipline", value=existing.get("discipline", ""))
+        primary_sector = st.text_input("Sector (Primary)", value=existing.get("primary_sector", ""))
+        secondary_sector = st.text_input("Sector (Secondary)", value=existing.get("secondary_sector", ""))
+        sub_category = st.text_input("Sub-Category (Focus Area)", value=existing.get("sub_category", ""))
+        functional_expertise = st.text_input("Functional Expertise", value=existing.get("functional_expertise", ""))
+        linkedin = st.text_input("LinkedIn (optional)", value=existing.get("linkedin", ""))
 
-        submitted = st.form_submit_button("Save and continue", use_container_width=True)
+        st.markdown("---")
+        st.subheader("Complete your connection profile")
 
-    if submitted:
-        errors = []
-        if not full_name.strip():
-            errors.append("Name is required.")
-        if not valid_email(email):
-            errors.append("A valid email address is required.")
-
-        if errors:
-            for error in errors:
-                st.error(error)
-        else:
-            try:
-                database.update_profile(
-                    profile["id"],
-                    {
-                        "full_name": full_name.strip(),
-                        "email": email.strip().lower(),
-                        "geography": geography.strip(),
-                        "category": category.strip(),
-                        "organization": organization.strip(),
-                        "discipline": discipline.strip(),
-                        "primary_sector": primary_sector.strip(),
-                        "secondary_sector": secondary_sector.strip(),
-                        "functional_expertise": functional_expertise.strip(),
-                        "current_context": current_context.strip(),
-                        "linkedin": linkedin.strip(),
-                    },
-                )
-                st.session_state.profile_id = profile["id"]
-                go_to("matching_form")
-                st.rerun()
-            except ValueError as exc:
-                st.error(str(exc))
-
-    if st.button("Back to search"):
-        go_to("landing")
-        st.rerun()
-
-
-# --------------------------------------------------------------------------
-# Stage: create_profile (brand new participant)
-# --------------------------------------------------------------------------
-
-def render_create_profile():
-    st.subheader("Create a profile")
-
-    similar = []
-    with st.form("create_profile_form"):
-        full_name = st.text_input("Full name (required)")
-        email = st.text_input("Email address (required)")
-        geography = st.text_input("Geography, country, or region (required)")
-        organization = st.text_input("Organization or company (required)")
-        current_context = st.text_area(
-            "Current role or professional context (required)", height=90
-        )
-        discipline = st.text_input("Main discipline (required)")
-        primary_sector = st.text_input("Primary sector (required)")
-        secondary_sector = st.text_input("Secondary sector (required)")
-        functional_expertise = st.text_input("Functional expertise (required)")
-        linkedin = st.text_input("LinkedIn (optional)")
-
-        if full_name.strip():
-            similar = database.find_similar_by_name(full_name)
-
-        confirm_new_person = False
-        if similar:
-            st.warning(
-                "We found existing profiles with a similar name: "
-                + ", ".join(s["full_name"] for s in similar)
-                + ". Please make sure this is not already you."
-            )
-            confirm_new_person = st.checkbox(
-                "I confirm this is a different person and I want to create a new profile."
-            )
-
-        submitted = st.form_submit_button("Create profile and continue", use_container_width=True)
-
-    if submitted:
-        errors = []
-        required_fields = {
-            "Full name": full_name,
-            "Email address": email,
-            "Geography": geography,
-            "Organization": organization,
-            "Current role or context": current_context,
-            "Discipline": discipline,
-            "Primary sector": primary_sector,
-            "Secondary sector": secondary_sector,
-            "Functional expertise": functional_expertise,
-        }
-        for label, value in required_fields.items():
-            if not value.strip():
-                errors.append(f"{label} is required.")
-        if not valid_email(email):
-            errors.append("A valid email address is required.")
-        if similar and not confirm_new_person:
-            errors.append(
-                "Please confirm you are a different person, or go back and search again."
-            )
-
-        if errors:
-            for error in errors:
-                st.error(error)
-        else:
-            try:
-                new_id = database.create_profile(
-                    {
-                        "source": "new",
-                        "full_name": full_name.strip(),
-                        "email": email.strip().lower(),
-                        "geography": geography.strip(),
-                        "organization": organization.strip(),
-                        "current_context": current_context.strip(),
-                        "discipline": discipline.strip(),
-                        "primary_sector": primary_sector.strip(),
-                        "secondary_sector": secondary_sector.strip(),
-                        "functional_expertise": functional_expertise.strip(),
-                        "linkedin": linkedin.strip(),
-                    }
-                )
-                st.session_state.profile_id = new_id
-                go_to("matching_form")
-                st.rerun()
-            except ValueError as exc:
-                st.error(str(exc))
-
-    if st.button("Back to search"):
-        go_to("landing")
-        st.rerun()
-
-
-# --------------------------------------------------------------------------
-# Stage: matching_form (interests, thesis, offer, needs, desired connections)
-# --------------------------------------------------------------------------
-
-def render_matching_form():
-    profile = database.get_profile(st.session_state.profile_id)
-    if not profile:
-        go_to("landing")
-        st.rerun()
-        return
-
-    st.subheader("Complete your connection profile")
-    st.write("Tell us more so we can recommend the right people to connect with.")
-
-    with st.form("matching_form"):
         interests = st.text_area(
             "What are your main areas of interest?",
-            value=profile.get("interests") or "",
-            height=90,
-            placeholder="e.g. Fintech, impact investing, AI, and startup development.",
+            value=existing.get("interests", ""),
+            placeholder="Fintech, impact investing, artificial intelligence, and startup development.",
         )
         investment_thesis = st.text_area(
             "What are you currently working on, or what is your investment thesis?",
-            value=profile.get("investment_thesis") or "",
-            height=90,
+            value=existing.get("investment_thesis", ""),
         )
         offering = st.text_area(
             "What can you offer other members of the cohort?",
-            value=profile.get("offering") or "",
-            height=90,
-            placeholder="e.g. Experience in project evaluation, public innovation, and ecosystem building.",
+            value=existing.get("offering", ""),
+            placeholder="Experience in project evaluation, public innovation, and ecosystem building.",
         )
         needs = st.text_area(
             "What are you looking for within the cohort?",
-            value=profile.get("needs") or "",
-            height=90,
-            placeholder="e.g. Meeting impact investors and people experienced in creative-industry funds.",
+            value=existing.get("needs", ""),
+            placeholder="Meeting impact investors and people with experience in creative-industry funds.",
         )
         desired_connections = st.text_area(
             "What type of people would you like to connect with?",
-            value=profile.get("desired_connections") or "",
-            height=90,
+            value=existing.get("desired_connections", ""),
         )
 
-        submitted = st.form_submit_button("Save and continue", use_container_width=True)
+        submitted = st.form_submit_button("Save and continue")
 
-    if submitted:
-        errors = []
-        if not interests.strip():
-            errors.append("Please share your main areas of interest.")
-        if not offering.strip():
-            errors.append("Please share what you can offer other members.")
-        if not needs.strip():
-            errors.append("Please share what you are looking for.")
-
-        if errors:
-            for error in errors:
-                st.error(error)
-        else:
-            database.update_profile(
-                profile["id"],
-                {
-                    "interests": interests.strip(),
-                    "investment_thesis": investment_thesis.strip(),
-                    "offering": offering.strip(),
-                    "needs": needs.strip(),
-                    "desired_connections": desired_connections.strip(),
-                },
-            )
-            go_to("consent")
-            st.rerun()
-
-
-# --------------------------------------------------------------------------
-# Stage: consent
-# --------------------------------------------------------------------------
-
-def render_consent():
-    profile = database.get_profile(st.session_state.profile_id)
-    if not profile:
-        go_to("landing")
-        st.rerun()
+    if not submitted:
         return
 
+    # Validacion basica
+    errors = []
+    if not full_name.strip():
+        errors.append("Full name is required.")
+    if not email.strip() or "@" not in email:
+        errors.append("A valid email address is required.")
+
+    if errors:
+        for e in errors:
+            st.error(e)
+        return
+
+    # Control de duplicados de correo (excluyendo el propio perfil si ya existe)
+    exclude_id = existing.get("id") if existing else None
+    email_owner = db.get_profile_by_email(email)
+    if email_owner and email_owner["id"] != exclude_id:
+        st.error(
+            f"This email is already registered under the name '{email_owner['full_name']}'. "
+            f"Please search for that profile instead, or use a different email."
+        )
+        return
+
+    # Si es un perfil nuevo, avisar (una sola vez) si hay perfiles con nombre parecido (posible duplicado)
+    if is_new and not st.session_state["duplicate_warning_shown"]:
+        similar = db.find_similar_profiles(full_name, email)
+        if similar:
+            st.warning(
+                "We found a similar profile already in the database: "
+                + ", ".join(s["full_name"] for s in similar)
+                + ". If this is you, go back and search for your name instead. "
+                + "Otherwise, click 'Save and continue' again to create this profile anyway."
+            )
+            st.session_state["duplicate_warning_shown"] = True
+            return
+
+    data = {
+        "full_name": full_name.strip(),
+        "email": email.strip().lower(),
+        "geography": geography.strip(),
+        "organization": organization.strip(),
+        "current_role": current_role_field.strip(),
+        "category": category.strip(),
+        "discipline": discipline.strip(),
+        "primary_sector": primary_sector.strip(),
+        "secondary_sector": secondary_sector.strip(),
+        "sub_category": sub_category.strip(),
+        "functional_expertise": functional_expertise.strip(),
+        "linkedin": linkedin.strip(),
+        "interests": interests.strip(),
+        "investment_thesis": investment_thesis.strip(),
+        "offering": offering.strip(),
+        "needs": needs.strip(),
+        "desired_connections": desired_connections.strip(),
+    }
+
+    if existing:
+        db.update_profile(existing["id"], data)
+        st.session_state["profile_id"] = existing["id"]
+    else:
+        data["source"] = "new"
+        data["original_excel_row"] = None
+        data["consent"] = 0
+        data["consent_date"] = None
+        new_id = db.create_profile(data)
+        st.session_state["profile_id"] = new_id
+        st.session_state["is_new_profile"] = False
+
+    st.session_state["duplicate_warning_shown"] = False
+    go_to("consent")
+
+
+# ---------------------------------------------------------------------------
+# STAGE: consent
+# ---------------------------------------------------------------------------
+
+CONSENT_TEXT = (
+    "I agree to participate in VC Institute Connection and authorize my name, email address, "
+    "and LinkedIn profile to be shared with participants who receive my profile as a recommended connection."
+)
+
+
+def render_consent_stage():
     st.subheader("Consent to participate")
-    st.write(CONSENT_TEXT)
-    agree = st.checkbox("I agree", value=bool(profile.get("consent")))
+    st.write("Before we generate your recommended connections, please confirm the following:")
 
-    if st.button("Confirm and see my connections", use_container_width=True):
-        if not agree:
-            st.error("You must agree to participate before we can generate connections.")
-        else:
-            database.update_profile(
-                profile["id"],
-                {"consent": 1, "consent_date": database.now_iso()},
+    agree = st.checkbox(CONSENT_TEXT)
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("Continue"):
+            profile = db.get_profile_by_id(st.session_state["profile_id"])
+            if not agree:
+                st.error("You must accept this statement to view your recommended connections.")
+                return
+            db.update_profile(profile["id"], {"consent": 1, "consent_date": db.now_iso()})
+
+            # Generar recomendaciones ahora que hay consentimiento
+            profile = db.get_profile_by_id(profile["id"])
+            recommendations = matching.generate_recommendations(profile)
+            db.save_recommendations(profile["id"], recommendations)
+
+            go_to("connections")
+
+    with col2:
+        if st.button("Not now"):
+            profile = db.get_profile_by_id(st.session_state["profile_id"])
+            db.update_profile(profile["id"], {"consent": 0})
+            st.info(
+                "No problem. Your profile has been saved, but we won't generate or share any "
+                "connections until you come back and accept."
             )
-            refreshed = database.get_profile(profile["id"])
-            results = matching.generate_recommendations(refreshed)
-            to_save = []
-            for result in results:
-                reason, topics = build_explanation(refreshed, result["profile"])
-                result["reason"] = reason
-                result["conversation_topics"] = topics
-                to_save.append(result)
-            database.save_recommendations(profile["id"], to_save)
-            st.session_state.recommendations = None
-            go_to("recommendations")
-            st.rerun()
 
 
-# --------------------------------------------------------------------------
-# Stage: recommendations
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# STAGE: connections
+# ---------------------------------------------------------------------------
 
-def render_recommendations():
-    profile = database.get_profile(st.session_state.profile_id)
-    if not profile or not profile.get("consent"):
-        go_to("consent")
-        st.rerun()
+def build_mailto_link(name, email):
+    subject = "Connection through VC Institute Connection"
+    body = (
+        f"Hi {name}, VC Institute Connection recommended that we connect based on our shared "
+        f"and complementary interests. I would be glad to meet you and explore potential areas "
+        f"for collaboration."
+    )
+    return f"mailto:{email}?subject={urllib.parse.quote(subject)}&body={urllib.parse.quote(body)}"
+
+
+def render_connections_stage():
+    st.subheader("Your recommended connections")
+
+    profile = db.get_profile_by_id(st.session_state["profile_id"])
+    if not profile or not profile["consent"]:
+        st.warning("You need to accept the consent statement first.")
+        if st.button("Go to consent step"):
+            go_to("consent")
         return
 
-    st.subheader("Your recommended connections")
-    recs = database.get_recommendations_for_user(profile["id"])
+    recommendations = db.get_recommendations_for_profile(profile["id"])
 
-    if not recs:
+    if not recommendations:
         st.info(
-            "We could not find any eligible matches for you right now. This "
-            "usually just means not enough other cohort members have added "
-            "their email, completed their interests, and consented yet. "
-            "Please check back in a few days: come back to this page, search "
-            "your name again, and confirm your consent once more to refresh "
-            "your recommendations."
+            "We don't have any recommended connections for you yet. This can happen if not enough "
+            "other participants have completed their profiles and accepted to participate. "
+            "Please check back later."
         )
     else:
-        for rec in recs:
-            with st.container(border=True):
+        for rec in recommendations:
+            first_name = rec["full_name"].split(" ")[0]
+            with st.container():
+                st.markdown('<div class="match-card">', unsafe_allow_html=True)
                 st.markdown(f"### {rec['full_name']}")
-                st.markdown(f"**Match: {rec['score']:.0f}%**")
+                st.markdown(f"<span class='match-score'>Match: {int(rec['score'])}%</span>", unsafe_allow_html=True)
 
-                subtitle_parts = []
-                if rec.get("organization"):
-                    subtitle_parts.append(rec["organization"])
-                if rec.get("current_role"):
-                    subtitle_parts.append(rec["current_role"])
-                if rec.get("geography"):
-                    subtitle_parts.append(rec["geography"])
-                if subtitle_parts:
-                    st.caption(" • ".join(subtitle_parts))
+                context_line = " · ".join(
+                    [v for v in [rec.get("organization"), rec.get("current_role") or rec.get("current_context"), rec.get("geography")] if v]
+                )
+                if context_line:
+                    st.caption(context_line)
 
-                st.markdown("**Why you should connect**")
+                st.write("**Why you should talk**")
                 st.write(rec["reason"])
 
-                topics = [t for t in (rec.get("conversation_topics") or "").split(" | ") if t]
-                if topics:
-                    st.markdown("**Topics to start the conversation**")
-                    for topic in topics:
-                        st.write(f"- {topic}")
+                if rec["conversation_topics"]:
+                    st.write("**Topics to start the conversation**")
+                    for t in rec["conversation_topics"]:
+                        st.write(f"- {t}")
 
                 if rec.get("offering"):
-                    st.markdown(f"**What they can offer:** {rec['offering']}")
+                    st.write(f"**What they can offer:** {rec['offering']}")
                 if rec.get("needs"):
-                    st.markdown(f"**What they are looking for:** {rec['needs']}")
+                    st.write(f"**What they are looking for:** {rec['needs']}")
 
-                st.markdown("**Contact**")
+                st.write("**Contact**")
                 st.write(rec["email"])
                 if rec.get("linkedin"):
                     st.write(rec["linkedin"])
 
-                subject = urllib.parse.quote("Connection through VC Institute Connection")
-                body = urllib.parse.quote(
-                    f"Hi {rec['full_name']}, VC Institute Connection recommended that we "
-                    "connect based on our shared and complementary interests. I would be "
-                    "glad to meet you and explore potential areas for collaboration."
-                )
-                mailto = f"mailto:{rec['email']}?subject={subject}&body={body}"
-                st.link_button("Contact via email", mailto, use_container_width=True)
+                mailto = build_mailto_link(first_name, rec["email"])
+                st.link_button("Contact via email", mailto)
 
-    if st.button("Continue to feedback", use_container_width=True):
+                st.markdown("</div>", unsafe_allow_html=True)
+
+    st.divider()
+    if st.button("Continue to feedback"):
         go_to("feedback")
-        st.rerun()
 
 
-# --------------------------------------------------------------------------
-# Stage: feedback
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# STAGE: feedback
+# ---------------------------------------------------------------------------
 
-def render_feedback():
-    profile = database.get_profile(st.session_state.profile_id)
-    if not profile:
-        go_to("landing")
-        st.rerun()
-        return
+RESULT_OPTIONS = [
+    "We shared knowledge",
+    "We identified common interests",
+    "A possible collaboration came up",
+    "A possible investment came up",
+    "An introduction or contact came up",
+    "We agreed to talk again",
+    "There wasn't enough of a fit",
+    "Other",
+]
 
+
+def render_feedback_stage():
     st.subheader("Was this connection useful?")
-    recs = database.get_recommendations_for_user(profile["id"])
 
-    if not recs:
-        st.info("You do not have any recommended connections to evaluate yet.")
+    profile = db.get_profile_by_id(st.session_state["profile_id"])
+    recommendations = db.get_recommendations_for_profile(profile["id"])
+
+    if not recommendations:
+        st.info("You don't have any recommended connections to evaluate yet.")
         return
 
-    options = {rec["recommended_profile_id"]: rec["full_name"] for rec in recs}
-    selected_id = st.selectbox(
-        "Select which connection you want to evaluate",
-        options=list(options.keys()),
-        format_func=lambda pid: options[pid],
-    )
+    already_evaluated_ids = {
+        f["evaluated_profile_id"] for f in db.get_feedback_given(profile["id"])
+    }
+
+    pending = [r for r in recommendations if r["recommended_profile_id"] not in already_evaluated_ids]
+
+    if not pending:
+        st.success("You have already shared feedback for all of your recommended connections. Thank you!")
+        return
+
+    options = {r["full_name"]: r for r in pending}
+    selected_name = st.selectbox("Which connection would you like to evaluate?", list(options.keys()))
+    selected = options[selected_name]
 
     with st.form("feedback_form"):
-        contacted = st.radio(
-            "Did you have a conversation with this person?", ["Yes", "Not yet"]
-        )
+        contacted = st.radio("Did you have a conversation with this person?", ["Yes", "Not yet"])
 
         usefulness_score = None
         result_type = None
         if contacted == "Yes":
-            usefulness_score = st.slider(
-                "How useful was the conversation? (1 = not useful, 5 = very useful)", 1, 5, 3
+            usefulness_score = st.select_slider(
+                "How useful was the conversation?",
+                options=[1, 2, 3, 4, 5],
+                value=3,
+                format_func=lambda v: {1: "1: Not useful", 5: "5: Very useful"}.get(v, str(v)),
             )
-            result_type = st.selectbox(
-                "What happened as a result of the conversation?", RESULT_TYPE_OPTIONS
-            )
+            result_type = st.selectbox("What happened as a result of the conversation?", RESULT_OPTIONS)
 
-        comment = st.text_area("Comment (optional)", height=80)
-        submitted = st.form_submit_button("Save feedback", use_container_width=True)
+        comment = st.text_area("Comment (optional)")
+
+        submitted = st.form_submit_button("Submit feedback")
 
     if submitted:
-        database.save_feedback(
-            {
-                "evaluator_profile_id": profile["id"],
-                "evaluated_profile_id": selected_id,
-                "contacted": "yes" if contacted == "Yes" else "not_yet",
-                "usefulness_score": usefulness_score,
-                "result_type": result_type,
-                "comment": comment.strip() or None,
-            }
-        )
-        st.success("Thank you. Your feedback has been saved.")
-
-    st.divider()
-    if st.button("Back to my connections", use_container_width=True):
-        go_to("recommendations")
+        db.save_feedback({
+            "evaluator_profile_id": profile["id"],
+            "evaluated_profile_id": selected["recommended_profile_id"],
+            "contacted": "yes" if contacted == "Yes" else "not_yet",
+            "usefulness_score": usefulness_score,
+            "result_type": result_type,
+            "comment": comment.strip() or None,
+        })
+        st.success("Thank you! Your feedback has been saved.")
         st.rerun()
 
 
-# --------------------------------------------------------------------------
-# Admin section (sidebar)
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Panel de administrador (barra lateral, protegido con contraseña)
+# ---------------------------------------------------------------------------
 
-def render_admin_sidebar():
+def render_admin_panel():
     with st.sidebar:
         st.markdown("### Administrator")
         password = st.text_input("Admin password", type="password", key="admin_password")
-        expected = st.secrets.get("ADMIN_PASSWORD") if hasattr(st, "secrets") else None
 
-        if not expected:
-            st.caption("Set ADMIN_PASSWORD in Streamlit secrets to enable exports.")
+        if not password:
             return
 
-        if password and password == expected:
-            st.success("Access granted.")
-            profiles_df = database.get_all_profiles_df()
+        # Acceso seguro a st.secrets: si no existe el archivo secrets.toml, no debe romper la app.
+        try:
+            expected = st.secrets["ADMIN_PASSWORD"]
+        except Exception:
+            expected = None
 
-            updated_profiles = profiles_df[
-                (profiles_df["source"] == "excel")
-                & (profiles_df["updated_at"] != profiles_df["created_at"])
-            ]
-            new_profiles = profiles_df[profiles_df["source"] == "new"]
-            feedback_df = database.get_all_feedback_df()
+        if not expected:
+            st.warning("ADMIN_PASSWORD is not configured in st.secrets.")
+            return
 
-            has_email = profiles_df["email"].fillna("").str.strip() != ""
-            consented = profiles_df["consent"] == 1
-
-            st.markdown("#### Usage")
-            st.metric("People who added their email", int(has_email.sum()))
-            st.metric("People who consented to participate", int(consented.sum()))
-            st.metric("New profiles created", len(new_profiles))
-            st.metric("Feedback entries submitted", len(feedback_df))
-            st.divider()
-
-            st.download_button(
-                "Download updated profiles (CSV)",
-                updated_profiles.to_csv(index=False).encode("utf-8"),
-                file_name="updated_profiles.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-            st.download_button(
-                "Download new profiles (CSV)",
-                new_profiles.to_csv(index=False).encode("utf-8"),
-                file_name="new_profiles.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-            st.download_button(
-                "Download feedback (CSV)",
-                feedback_df.to_csv(index=False).encode("utf-8"),
-                file_name="feedback.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
-        elif password:
+        if password != expected:
             st.error("Incorrect password.")
+            return
+
+        st.success("Access granted.")
+        profiles_df = db.get_all_profiles_df()
+        feedback_df = db.get_all_feedback_df()
+
+        updated_profiles = profiles_df[profiles_df["source"] == "excel"]
+        new_profiles = profiles_df[profiles_df["source"] == "new"]
+
+        st.download_button(
+            "Download updated profiles (CSV)",
+            updated_profiles.to_csv(index=False).encode("utf-8"),
+            file_name="updated_profiles.csv",
+            mime="text/csv",
+        )
+        st.download_button(
+            "Download new profiles (CSV)",
+            new_profiles.to_csv(index=False).encode("utf-8"),
+            file_name="new_profiles.csv",
+            mime="text/csv",
+        )
+        st.download_button(
+            "Download feedback (CSV)",
+            feedback_df.to_csv(index=False).encode("utf-8"),
+            file_name="feedback.csv",
+            mime="text/csv",
+        )
 
 
-# --------------------------------------------------------------------------
-# Main
-# --------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Router principal
+# ---------------------------------------------------------------------------
 
 def main():
-    bootstrap()
-    init_session_state()
-    render_header()
+    render_admin_panel()
     render_progress()
-    render_admin_sidebar()
 
-    stage = st.session_state.stage
-    if stage == "landing":
-        render_landing()
-    elif stage == "review_profile":
-        render_review_profile()
-    elif stage == "create_profile":
-        render_create_profile()
-    elif stage == "matching_form":
-        render_matching_form()
+    stage = st.session_state["stage"]
+    if stage == "search":
+        render_search_stage()
+    elif stage == "profile_form":
+        render_profile_form_stage()
     elif stage == "consent":
-        render_consent()
-    elif stage == "recommendations":
-        render_recommendations()
+        render_consent_stage()
+    elif stage == "connections":
+        render_connections_stage()
     elif stage == "feedback":
-        render_feedback()
+        render_feedback_stage()
     else:
-        go_to("landing")
+        st.session_state["stage"] = "search"
         st.rerun()
 
 
